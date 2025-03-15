@@ -1,12 +1,24 @@
 import torch
 from torch import nn
 from torch.optim import Adam 
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from cube import Cube, get_reverse_move
 import random
 import os
 
 DEVICE = 'mps' if torch.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
+
+class CubeDataSet(Dataset):
+  def __init__(self, states, moves) -> None:
+    self.states = states
+    self.moves = moves
+  
+  def __len__(self):
+    return len(self.states)
+  
+  def __getitem__(self, idx):
+    return self.states[idx], self.moves[idx]
 
 class CubeNet(nn.Module):
   def __init__(self, ) -> None:
@@ -52,17 +64,18 @@ def check_for_reversal(scramble: list[int]) -> bool:
       return True
   return False
 
-def get_loader() -> torch.utils.data.DataLoader:
-  if os.path.exists("data/cube_states.pt") and os.path.exists("data/cube_moves.pt"):
-    with open("data/cube_states.pt", "rb") as f:
-      X = torch.load(f)
-    with open("data/cube_moves.pt", "rb") as f:
-      Y = torch.load(f)
-    return torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X, Y), batch_size=SCRAMBLE_SIZE * 100, shuffle=True)
+def get_loader(size:int=1000, batch_size:int=128, saves:list[tuple[str]]=None) -> tuple[torch.Tensor, torch.Tensor]:
+  if saves is not None:
+    print("Loading from saves")
+    files = saves.pop()
+    states = torch.load(files[0])
+    moves = torch.load(files[1])
+    dataset = CubeDataSet(states, moves)
+    return DataLoader(dataset, batch_size=batch_size)
 
   states = []
   moves = []
-  for _ in tqdm(range(50000)):
+  for _ in tqdm(range(size)):
     cube = Cube()
 
     while 1:
@@ -74,21 +87,15 @@ def get_loader() -> torch.utils.data.DataLoader:
       cube.move(m)
       states.append(get_state(cube))
       moves.append(get_reverse_move(m))
+  dataset = CubeDataSet(torch.stack(states), torch.stack(moves))
+  #X = torch.stack(states)
+  #Y = torch.stack(moves)
+  return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-  X = torch.stack(states)
-  Y = torch.stack(moves)
-
-  with open("data/cube_states.pt", "wb") as f:
-    torch.save(X, f)
-  with open("data/cube_moves.pt", "wb") as f:
-    torch.save(Y, f)
-
-  return torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X, Y), batch_size=SCRAMBLE_SIZE * 100, shuffle=True)
-
-def train(model, train_loader, criterion, optimizer, device):
+def train(model, criterion, optimizer, device, data):
   model.train()
 
-  for X, Y in (t:=tqdm(train_loader)):
+  for X, Y in (t:=tqdm(get_loader(saves=data))):
     X, Y = X.to(device), Y.to(device)
     optimizer.zero_grad()
 
@@ -99,13 +106,13 @@ def train(model, train_loader, criterion, optimizer, device):
 
     if t.n % 100 == 0: t.set_description(f"loss: {loss.item():.4f}")
 
-def test(model, test_loader, device):
+def test(model, device):
   model.eval()
   correct = 0
   total = 0
   
   with torch.no_grad():
-    for X, Y in (t:=tqdm(test_loader)):
+    for X, Y in (t:=tqdm(get_loader(1000, 32))):
       X, Y = X.to(device), Y.to(device)
       outputs = model(X)
       total += Y.size(0)
@@ -120,31 +127,14 @@ def main() -> None:
   criterion = nn.CrossEntropyLoss()
   optimizer = Adam(model.parameters(), lr=1e-3)
 
+  data = [(f'data/states{i}.pt', f'data/moves{i}.pt') for i in range(10)]
+
   epochs = 10
-  loader = get_loader()
   for epoch in range(epochs):
-    train(model, loader, criterion, optimizer, DEVICE)
+    train(model, criterion, optimizer, DEVICE, data)
 
-  test(model, loader, DEVICE)
-
-  cube = Cube()
-
+  test(model, DEVICE)
   import time
-
-  for _ in range(1):
-    cube.reset()
-
-    while 1:
-      scramble = [random.randint(0, 12) for _ in range(SCRAMBLE_SIZE)]
-      if not check_for_reversal(scramble):
-        break
-    cube.scramble(scramble)
-
-    for move in scramble[::-1]:
-      cube.move(model(get_state(cube).unsqueeze(0).to(DEVICE)).argmax().item())
-      cube.show()
-      time.sleep(0.5)
-
   torch.save(model.state_dict(), f'models/cube{time.time()}.pth')
 
 if __name__ == "__main__":
